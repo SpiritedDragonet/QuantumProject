@@ -1,0 +1,10 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Your rule content
+
+- 注释统一使用中文
+- 在每个文档里，不仅要介绍每个函数的作用，还要介绍其中一些关键的变量或数据结构（数据结构的维数，大小，特点等信息）
