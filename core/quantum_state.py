@@ -992,6 +992,9 @@ if __name__ == "__main__":
     frames = system_state.frames
     print(f"共有 {len(frames)} 个帧")
     
+    # 设置NumPy打印选项，控制显示精度为小数点后两位
+    np.set_printoptions(precision=2, suppress=True)
+
     for i, frame in enumerate(frames, 1):
         print(f"\n帧 {i}:")
         print(f"帧键: {list(frame.keys())}")
@@ -1026,7 +1029,21 @@ if __name__ == "__main__":
                     print(f"    子系统类型: {sys_info['types']}")
                 if 'subsystem_structure' in sys_info:
                     print(f"    子系统结构: {sys_info['subsystem_structure']}")
-        
+                
+                # 打印密度矩阵（仅显示到小数点后两位）
+                if 'rho' in sys_info and isinstance(sys_info['rho'], np.ndarray):
+                    rho = sys_info['rho']
+                    print(f"    密度矩阵 (维度 {rho.shape}):")
+                    # 对于大型矩阵，只打印左上角10x10的子矩阵
+                    if rho.shape[0] > 10:
+                        print("    (仅显示左上角10x10子矩阵)")
+                        print(rho[:10, :10])
+                    else:
+                        print(rho)
+                    
         print("-" * 40)
     
+    # 恢复NumPy默认打印选项
+    np.set_printoptions(precision=8, suppress=False)
+
     print("\n===== 自检完成 =====")
