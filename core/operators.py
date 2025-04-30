@@ -1,422 +1,794 @@
 # coding=utf-8
-# noise_models.py
+# operators.py
 
 """
-噪声模型与量子退相干模块 (基于 QuTiP)
+量子算符构建模块 (基于 QuTiP)
 
-本模块负责根据物理参数构建 Lindblad 崩塌算符 (c_ops) 列表，
-用于描述量子系统的各种退相干和耗散过程。
+本模块提供灵活的函数来构建和操作量子算符，特别适用于多能级原子和腔系统。
+通过这些函数，可以方便地构建复杂的哈密顿量和Lindblad算符。
 
-支持新的 QuantumState 结构，可以为多种不同大小的量子系统构建噪声模型。
+主要功能：
+1. 将小维度算符嵌入到更大的希尔伯特空间中
+2. 将单体算符扩展到多体系统的张量积空间
+3. 构造多体相互作用项
+4. 创建原子系统的常用算符、哈密顿量和Lindblad项
+5. 创建腔场系统的常用算符、哈密顿量和Lindblad项
+6. 创建原子-腔相互作用的算符
+7. 辅助函数：构建总哈密顿量、时间依赖哈密顿量、旋转坐标系变换等
 
 函数调用关系图：
 ```mermaid
 graph TD
-    %% LindbladSolver类
-    solver_init[LindbladSolver.__init__] --> None
-    solver_evolve[LindbladSolver.evolve_density_matrix] --> None
-    solver_solve[LindbladSolver.solve] --> None
-    solver_stats[LindbladSolver.get_performance_stats] --> None
-    
-    %% NoiseModelBuilder类
-    init[NoiseModelBuilder.__init__] --> None
-    build_collapse[NoiseModelBuilder.build_collapse_operators] --> add_spont_em
-    build_collapse --> add_cavity
-    
-    %% 算符添加方法
-    add_spont_em[NoiseModelBuilder.add_spontaneous_emission] --> _add_op
-    add_cavity[NoiseModelBuilder.add_cavity_decay] --> _add_op
-    add_dephasing[NoiseModelBuilder.add_dephasing] --> _add_op
-    _add_op[NoiseModelBuilder._add_op_to_list] --> get_operator[QuantumState.get_operator]
-    
-    %% 静态工厂方法
-    factory_build[NoiseModelBuilder.build_for_system] --> build_collapse
-    factory_multi[NoiseModelBuilder.build_multi_system_noise] --> factory_build
+    %% 基础量子算符构建函数
+    embed_op[embed_op_in_subspace] --> None
+    local_op[local_operator] --> None
+    interact[interaction_term] --> local_op
+
+    %% 集成量子算符生成函数
+    create_atom[create_atomic_operators] --> embed_op
+    create_atom --> interact
+    create_cavity[create_cavity_operators] --> None
+    create_interact[create_interaction_operators] --> None
+
+    %% 辅助函数
+    build_total[build_total_hamiltonian] --> None
+    build_time[build_time_dependent_hamiltonian] --> None
+    apply_rotate[apply_rotating_frame] --> None
+    check_herm[check_hermitian] --> None
 ```
 """
 
 import numpy as np
 import qutip as qt
-import time
-import logging
-from typing import Dict, List, Tuple, Any, Optional, Union, Callable, Set
+from typing import List, Dict, Optional, Union, Callable, Any, Tuple
 
-# 导入配置模块和量子态模块
-from config import get_config_value
-from core.quantum_state import QuantumState
 
-# 设置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# ================ 量子算符构建函数 ================
 
-class LindbladSolver:
+def embed_op_in_subspace(op_small: qt.Qobj,
+                         index_map: List[int],
+                         big_dim: int) -> qt.Qobj:
     """
-    Lindblad主方程求解器
-    
-    实现量子开放系统的Lindblad主方程求解，包括相干演化和退相干过程。
-    该类主要使用QuTiP的求解器，并添加了特定于DLCZ协议的功能。
+    将仅作用于少数能级的算符 op_small（形状 m×m）
+    嵌入到一个 big_dim×big_dim 的更大希尔伯特空间中。
+
+    被调用者: 外部调用
+    调用: 无其他函数
+
+    参数:
+    -------
+    op_small : qutip.Qobj
+        小算符 (m×m)，如针对两能级的 [[0,Ω/2],[Ω/2, -Δ]]。
+    index_map : list of int
+        指明旧算符 op_small 的第 row/col 索引 (0..m-1)
+        应映射到新空间的哪几个能级 (0..big_dim-1)。
+        例如如果 op_small 是 2×2，index_map = [0,2]
+        就表示旧 |0>,|1> 分别对应新空间的 |0>,|2>。
+    big_dim : int
+        新空间的维度（如 5 表示五能级原子）。
+
+    返回:
+    -------
+    Qobj, 形状 (big_dim×big_dim),
+    其在 index_map 对应的子空间里与 op_small 完全相同，
+    其他行列元素全为 0。
+
+    示例:
+    -------
+    >>> Delta = 1.0
+    >>> Omega = 0.2
+    >>> H_2lvl = qt.Qobj([[-Delta, Omega/2], [Omega/2, 0]])
+    >>> embed_idx_map = [0, 2]  # 旧 |g>=0 -> 新系统的 0级; 旧 |e>=1 -> 新系统的 2级
+    >>> H_5lvl_drive = embed_op_in_subspace(H_2lvl, embed_idx_map, 5)
     """
-    
-    def __init__(self):
-        """
-        初始化Lindblad求解器
-        
-        被调用者: 外部调用, TimeEvolution.__init__
-        调用: 无其他函数
-        """
-        # 性能统计
-        self.solve_time = 0
-        self.solve_count = 0
-        
-    def evolve_density_matrix(self, rho: qt.Qobj, hamiltonian: qt.Qobj, 
-                           c_ops: List[qt.Qobj], dt: float) -> qt.Qobj:
-        """
-        单步演化密度矩阵
-        
-        使用QuTiP的演化函数进行单步Lindblad演化
-        
-        被调用者: TimeEvolution.evolve_system, TimeEvolution.evolve_all_systems
-        调用: qt.mesolve
-        
-        参数:
-            rho: 当前密度矩阵
-            hamiltonian: 哈密顿量
-            c_ops: 崩塌算符列表
-            dt: 时间步长
-            
-        返回:
-            qt.Qobj: 演化后的密度矩阵
-        """
-        start_time = time.time()
-        
-        # 只计算一步，从t=0到t=dt
-        tlist = np.array([0, dt])
-        
-        # 设置选项：禁用进度条，不存储所有状态，只需最终状态
-        options = {
-            'store_states': False,
-            'progress_bar': False
-        }
-        
-        # 使用QuTiP的mesolve求解
-        result = qt.mesolve(hamiltonian, rho, tlist, c_ops, [], options=options)
-        
-        # 更新统计信息
-        self.solve_time += time.time() - start_time
-        self.solve_count += 1
-        
-        # 返回最终状态
-        return result.states[-1]
-        
-    def solve(self, hamiltonian: qt.Qobj, rho0: qt.Qobj, tlist: np.ndarray, 
-             c_ops: List[qt.Qobj], e_ops: Optional[List[qt.Qobj]] = None) -> Any:
-        """
-        求解Lindblad主方程
-        
-        使用QuTiP的mesolve求解器，计算给定哈密顿量和跃迁算符下系统的演化。
-        
-        被调用者: TimeEvolution.evolve_multiple_steps
-        调用: qt.mesolve
-        
-        参数:
-            hamiltonian: 系统哈密顿量
-            rho0: 初始量子态（密度矩阵或态矢量）
-            tlist: 时间点数组
-            c_ops: 跃迁算符列表
-            e_ops: 期望值算符列表
-            
-        返回:
-            qt.solver.Result: 求解结果，包含随时间演化的态和期望值
-        """
-        start_time = time.time()
-        
-        # 设置默认选项
-        options = {
-            'store_states': True,
-            'atol': 1e-8,
-            'rtol': 1e-6
-        }
-        
-        # 使用QuTiP的mesolve求解
-        result = qt.mesolve(hamiltonian, rho0, tlist, c_ops, e_ops, options=options)
-        
-        # 更新统计信息
-        self.solve_time += time.time() - start_time
-        self.solve_count += 1
-        
-        return result
-        
-    def get_performance_stats(self) -> Dict[str, float]:
-        """
-        获取求解器性能统计信息
-        
-        被调用者: 外部调用
-        调用: 无其他函数
-        
-        返回:
-            Dict[str, float]: 包含性能统计的字典
-        """
-        avg_time = self.solve_time / max(1, self.solve_count)
-        
-        return {
-            'total_solve_time': self.solve_time,
-            'solve_count': self.solve_count,
-            'avg_solve_time': avg_time
-        }
+    # 先用 NumPy 矩阵来装（也可使用稀疏格式）
+    data = np.zeros((big_dim, big_dim), dtype=complex)
 
-class NoiseModelBuilder:
+    # 嵌入对应的子块
+    for r_old, r_new in enumerate(index_map):
+        for c_old, c_new in enumerate(index_map):
+            data[r_new, c_new] = op_small[r_old, c_old]
+
+    # 转成 Qobj，维度标签为 [[big_dim], [big_dim]]
+    return qt.Qobj(data, dims=[[big_dim], [big_dim]])
+
+
+def local_operator(op_single: qt.Qobj,
+                   who: int,
+                   dims: List[int]) -> qt.Qobj:
     """
-    构建 Lindblad 崩塌算符 (c_ops) 列表。
-    
-    根据配置参数（如衰减率、退相干率）和量子态信息，
-    组装描述各种噪声过程的 QuTiP 算符列表。
-    支持多种系统尺寸和类型。
+    将单个子系统上的算符 op_single 嵌入到多子系统直积空间。
+
+    被调用者: 外部调用, interaction_term
+    调用: 无其他函数
+
+    参数:
+    -------
+    op_single : qutip.Qobj
+        作用在单个子系统上的算符，维度必须与 dims[who] 相匹配。
+    who : int
+        指定这是作用在第几个子系统 (0-based) 上的算符。
+    dims : list of int
+        整个系统的各子空间维度, 如 [5, 3, 5] 表示三部分:
+         - 第0个子系统5维(五能级原子)
+         - 第1个子系统3维(单模腔)
+         - 第2个子系统5维(另一个五能级原子)
+
+    返回:
+    -------
+    Qobj, 其尺寸是 (Πdims × Πdims)，
+    在第 who 个子空间放置 op_single，其他子空间放置单位阵。
+
+    示例:
+    -------
+    >>> H_5lvl_drive_single = embed_op_in_subspace(H_2lvl, [0, 2], 5)
+    >>> H_drive_atom1 = local_operator(H_5lvl_drive_single, who=1, dims=[5,5,5])
     """
-    
-    def __init__(self, quantum_state: QuantumState):
-        """
-        初始化噪声模型构建器。
-        
-        被调用者: 外部调用, build_for_system
-        调用: 无其他函数
-        
-        参数:
-            quantum_state: 关联的 QuantumState 对象，提供维度和算符构建支持。
-            
-        抛出:
-            TypeError: 如果quantum_state不是QuantumState实例
-        """
-        if not isinstance(quantum_state, QuantumState):
-            raise TypeError("必须提供一个 QuantumState 实例")
-        self.qs = quantum_state
-        self.c_ops: List[qt.Qobj] = []
-        
-        logger.info(f"NoiseModelBuilder 初始化完成，关联到系统 '{self.qs.system_name}'")
+    op_list = []
+    for i, d in enumerate(dims):
+        if i == who:
+            op_list.append(op_single)
+        else:
+            op_list.append(qt.qeye(d))
+    return qt.tensor(op_list)
 
-    def _add_op_to_list(self, base_op: qt.Qobj, rate: float, target_subsystem_idx: int):
-        """
-        将局域算符乘以 sqrt(rate)，扩展到全局空间，并添加到 c_ops 列表。
-        
-        被调用者: add_spontaneous_emission, add_cavity_decay, add_dephasing
-        调用: QuantumState.get_operator
-        
-        参数:
-            base_op: 局部算符
-            rate: 噪声速率
-            target_subsystem_idx: 目标子系统的索引
-        """
-        if rate > 1e-15: # 只添加速率大于阈值的算符
-            global_op = self.qs.get_operator(np.sqrt(rate) * base_op, target_subsystem_idx)
-            self.c_ops.append(global_op)
-            logger.debug(f"添加崩塌算符: target={self.qs.subsystem_names[target_subsystem_idx]}, rate={rate:.4g}")
 
-    def add_spontaneous_emission(self, decay_rate: float, atom_idx: int, level_trans: Tuple[int, int]):
-        """
-        添加原子的自发辐射通道。
-        
-        被调用者: build_collapse_operators
-        调用: _add_op_to_list
-        
-        参数:
-            decay_rate: 衰减率 (gamma)
-            atom_idx: 目标原子的索引
-            level_trans: 跃迁的能级对 (level_final, level_initial)，例如 (0, 2) 代表 |0⟩⟨2|
-        """
-        level_final, level_initial = level_trans
-        # 检查能级是否有效
-        atom_dim = self.qs.dims[atom_idx]
-        if not (0 <= level_final < atom_dim and 0 <= level_initial < atom_dim):
-             logger.warning(f"原子 {atom_idx} 的自发辐射跃迁能级 {level_trans} 无效 (原子维度 {atom_dim})，跳过此通道。")
-             return
-             
-        # 构建局域跃迁算符 |final⟩⟨initial|
-        local_op = qt.basis(atom_dim, level_final) * qt.basis(atom_dim, level_initial).dag()
-        # 添加到 c_ops 列表 (自动乘以 sqrt(rate) 并扩展)
-        self._add_op_to_list(local_op, decay_rate, atom_idx)
-        logger.info(f"添加原子 {atom_idx} 自发辐射: |{level_final}⟩⟨{level_initial}|, rate={decay_rate:.4g}")
+def interaction_term(op_i: qt.Qobj,
+                     i: int,
+                     op_j: qt.Qobj,
+                     j: int,
+                     factor: float,
+                     dims: List[int]) -> qt.Qobj:
+    """
+    构造两体相互作用项 (如里德堡阻塞、偶极-偶极等)，
+    只在第 i 和第 j 个子系统上非平凡，其他子系统为单位算符。
 
-    def add_cavity_decay(self, kappa: float, cavity_idx: int):
-        """
-        添加腔场的衰减通道。
-        
-        被调用者: build_collapse_operators
-        调用: _add_op_to_list
-        
-        参数:
-            kappa: 腔场衰减率
-            cavity_idx: 目标腔场的索引
-        """
-        # 检查腔维度
-        cavity_dim = self.qs.dims[cavity_idx]
-        # 构建腔场湮灭算符
-        a = qt.destroy(cavity_dim)
-        # 添加到 c_ops 列表
-        self._add_op_to_list(a, kappa, cavity_idx)
-        logger.info(f"添加腔 {cavity_idx} 衰减: 速率 kappa={kappa:.4g}")
+    被调用者: 外部调用
+    调用: local_operator
 
-    def add_dephasing(self, dephasing_rate: float, target_subsystem_idx: int, op_type: str = 'sz'):
-        """
-        添加退相干通道，包括相位退相干和去极化噪声。
-        
-        被调用者: build_collapse_operators
-        调用: _add_op_to_list
-        
-        参数:
-            dephasing_rate: 退相干率
-            target_subsystem_idx: 目标子系统的索引
-            op_type: 算符类型 ('sz'=相位退相干, 'sx/sy/sz'=去极化)
-        """
-        target_dim = self.qs.dims[target_subsystem_idx]
-        
-        if op_type == 'sz':
-            # 对角算符，例如原子的 σz 或腔场的光子数算符
-            if target_dim >= 2:
-                if self.qs.subsystem_types[target_subsystem_idx] == 'atom':
-                    # 对于原子，使用 σz 算符
-                    diag_elements = np.zeros(target_dim)
-                    for i in range(target_dim):
-                        diag_elements[i] = 1 if i % 2 == 1 else -1
-                else:
-                    # 对于其他类型，使用编号算符
-                    diag_elements = np.arange(target_dim)
-                    
-                op = qt.Qobj(np.diag(diag_elements))
-                self._add_op_to_list(op, dephasing_rate, target_subsystem_idx)
-                logger.info(f"添加子系统 {target_subsystem_idx} 的相位退相干: rate={dephasing_rate:.4g}")
-                
-        elif op_type in ['sx', 'sy'] and target_dim >= 2:
-            # σx 或 σy 算符
-            if op_type == 'sx':
-                op = qt.sigmax() if target_dim == 2 else qt.jmat((target_dim-1)/2, 'x')
-            else:
-                op = qt.sigmay() if target_dim == 2 else qt.jmat((target_dim-1)/2, 'y')
-                
-            self._add_op_to_list(op, dephasing_rate, target_subsystem_idx)
-            logger.info(f"添加子系统 {target_subsystem_idx} 的 σ{op_type[1]} 退相干: rate={dephasing_rate:.4g}")
+    参数:
+    -------
+    op_i : qutip.Qobj
+        作用在第 i 个子系统上的算符(维度 dims[i]×dims[i])。
+    i : int
+        子系统 i 的索引。
+    op_j : qutip.Qobj
+        作用在第 j 个子系统上的算符(维度 dims[j]×dims[j])。
+    j : int
+        子系统 j 的索引。
+    factor : float
+        该相互作用的整体系数 (coupling strength, V_rr 等)。
+    dims : list of int
+        整个系统的各子空间维度。
 
-    def build_collapse_operators(self) -> List[qt.Qobj]:
+    返回:
+    -------
+    Qobj, 其尺寸是 (Πdims × Πdims)。
+    表达式形如 factor * (I⊗...⊗op_i⊗...⊗op_j⊗...)。
+
+    示例:
+    -------
+    >>> P_r = qt.basis(5,4)*qt.basis(5,4).dag()  # 5x5, 在 |4> 上投影
+    >>> V_rr = 2*np.pi*10e-3  # 10 MHz
+    >>> H_block_01 = interaction_term(P_r, 0, P_r, 1, V_rr, dims=[5,5,5])
+    """
+    assert i != j, "interaction_term: i 与 j 必须是不同子系统！"
+    op_list = []
+    for idx, d in enumerate(dims):
+        if   idx == i: op_list.append(op_i)
+        elif idx == j: op_list.append(op_j)
+        else:          op_list.append(qt.qeye(d))
+    return factor * qt.tensor(op_list)
+
+
+# ================ 集成量子算符生成函数 ================
+
+def create_atomic_operators(dim: int, level_labels: Optional[List[str]] = None,
+                           energies: Optional[List[float]] = None) -> Dict[str, Any]:
+    """
+    创建原子系统的常用算符，包括投影算符、跃迁算符、哈密顿量和Lindblad项。
+
+    被调用者: 外部调用
+    调用: embed_op_in_subspace, interaction_term
+
+    参数:
+    -------
+    dim : int
+        原子系统的希尔伯特空间维度
+    level_labels : Optional[List[str]]
+        能级标签列表，如 ['g', 's', 'e0', 'e1', 'r']
+    energies : Optional[List[float]]
+        各能级的能量，长度应等于dim。若为None，则所有能级能量为0
+
+    返回:
+    -------
+    Dict[str, Any]: 常用算符的字典，包括：
+        - 基本算符:
+          - 'P_i': 第i个能级的投影算符 |i⟩⟨i|
+          - 'sigma_ij': 从j到i的跃迁算符 |i⟩⟨j|
+          - 对于二能级系统，还包括泡利算符 'sigma_x', 'sigma_y', 'sigma_z'
+        - 哈密顿量:
+          - 'H_0': 本征能量哈密顿量
+        - 构建函数:
+          - 'drive': 函数，用于构建驱动哈密顿量
+          - 'spontaneous_emission': 函数，用于构建自发辐射Lindblad算符
+          - 'dephasing': 函数，用于构建退相位Lindblad算符
+          - 'rydberg_interaction': 函数，用于构建Rydberg相互作用哈密顿量
+    """
+    ops = {}
+
+    # 使用默认标签或提供的标签
+    if level_labels is None:
+        if dim == 2:
+            level_labels = ['g', 'e']
+        elif dim == 3:
+            level_labels = ['g', 's', 'e']
+        elif dim == 4:
+            level_labels = ['g', 's', 'e0', 'e1']
+        elif dim == 5:
+            level_labels = ['g', 's', 'e0', 'e1', 'r']
+        else:
+            level_labels = [str(i) for i in range(dim)]
+
+    # 投影算符
+    for i in range(dim):
+        # 数字索引的投影算符
+        ops[f'P_{i}'] = qt.basis(dim, i) * qt.basis(dim, i).dag()
+        # 使用能级标签的投影算符
+        if i < len(level_labels):
+            ops[f'P_{level_labels[i]}'] = ops[f'P_{i}']
+
+    # 跃迁算符
+    for i in range(dim):
+        for j in range(dim):
+            if i != j:
+                # 数字索引的跃迁算符
+                ops[f'sigma_{i}{j}'] = qt.basis(dim, i) * qt.basis(dim, j).dag()
+                # 使用能级标签的跃迁算符
+                if i < len(level_labels) and j < len(level_labels):
+                    ops[f'sigma_{level_labels[i]}{level_labels[j]}'] = ops[f'sigma_{i}{j}']
+
+    # 对于二能级系统，添加泡利算符
+    if dim == 2:
+        ops['sigma_x'] = qt.sigmax()
+        ops['sigma_y'] = qt.sigmay()
+        ops['sigma_z'] = qt.sigmaz()
+        ops['sigma_plus'] = qt.sigmap()
+        ops['sigma_minus'] = qt.sigmam()
+
+    # 本征能量哈密顿量
+    if energies is None:
+        energies = np.zeros(dim)
+    elif len(energies) != dim:
+        raise ValueError(f"能量列表长度 {len(energies)} 与系统维度 {dim} 不匹配")
+
+    ops['H_0'] = qt.Qobj(np.diag(energies), dims=[[dim], [dim]])
+
+    # 驱动哈密顿量构建函数
+    def drive(rabi_freq: float, detuning: float, level_i: int, level_j: int) -> qt.Qobj:
         """
-        构建所有噪声通道的崩塌算符列表。
-        
-        被调用者: 外部调用, build_for_system
-        调用: add_spontaneous_emission, add_cavity_decay, add_dephasing,
-              QuantumState.get_subsystems_by_type
-        
+        构建描述经典驱动场（激光/微波）的哈密顿量。
+
+        参数:
+        -------
+        rabi_freq : float
+            Rabi频率（单位：rad/s）
+        detuning : float
+            失谐（单位：rad/s）
+        level_i : int
+            第一个能级索引
+        level_j : int
+            第二个能级索引（通常是更高能级）
+
         返回:
-            List[qt.Qobj]: 所有崩塌算符列表
+        -------
+        qt.Qobj: 驱动哈密顿量，形式为 (Ω/2)(|i⟩⟨j|+|j⟩⟨i|) - Δ|j⟩⟨j|
         """
-        # 清空现有的算符列表
-        self.c_ops = []
-        
-        # 添加原子噪声
-        atom_indices = self.qs.get_subsystems_by_type('atom')
-        if atom_indices:
-            # 从配置中获取原子噪声参数
-            gamma_sp = get_config_value('atom', 'gamma_sp', default=2.0 * np.pi * 6e6)  # 自发辐射率 (rad/s)
-            gamma_dephasing = get_config_value('atom', 'gamma_dephasing', default=2.0 * np.pi * 1e3)  # 退相干率 (rad/s)
-            
-            # 添加原子自发辐射和退相干
-            for atom_idx in atom_indices:
-                atom_dim = self.qs.dims[atom_idx]
-                
-                # 添加主要的自发辐射通道
-                if atom_dim >= 3: # 至少有 |g₁⟩, |g₂⟩, |e₁⟩
-                    self.add_spontaneous_emission(gamma_sp, atom_idx, (0, 2))     # |e₁⟩ → |g₁⟩
-                    self.add_spontaneous_emission(gamma_sp * 0.5, atom_idx, (1, 2))  # |e₁⟩ → |g₂⟩
-                
-                # 如果有第二个激发态，添加相应的通道
-                if atom_dim >= 4: # 有 |e₂⟩
-                    self.add_spontaneous_emission(gamma_sp * 0.5, atom_idx, (0, 3))  # |e₂⟩ → |g₁⟩
-                    self.add_spontaneous_emission(gamma_sp, atom_idx, (1, 3))     # |e₂⟩ → |g₂⟩
-                    
-                # 如果有里德堡态，添加其衰减通道
-                if atom_dim >= 5: # 有 |r⟩
-                    for i in range(2):  # 衰减到两个基态
-                        self.add_spontaneous_emission(gamma_sp * 0.1, atom_idx, (i, 4))
-                    for i in range(2, 4):  # 衰减到两个激发态
-                        self.add_spontaneous_emission(gamma_sp * 0.05, atom_idx, (i, 4))
-                        
-                # 为所有能级添加退相干
-                self.add_dephasing(gamma_dephasing, atom_idx, 'sz')
-        
-        # 添加腔噪声
-        cavity_indices = self.qs.get_subsystems_by_type('cavity')
-        if cavity_indices:
-            # 从配置中获取腔噪声参数
-            kappa = get_config_value('cavity', 'kappa', default=2.0 * np.pi * 1e6)  # 腔衰减率 (rad/s)
-            
-            # 添加腔光子损失算符
-            for cavity_idx in cavity_indices:
-                self.add_cavity_decay(kappa, cavity_idx)
-        
-        logger.info(f"为系统 '{self.qs.system_name}' 构建了 {len(self.c_ops)} 个崩塌算符")
-        return self.c_ops
-    
-    @staticmethod
-    def build_for_system(quantum_state: QuantumState, 
-                        noise_types: Optional[List[str]] = None) -> List[qt.Qobj]:
+        # 添加耦合项
+        H_coupling = (rabi_freq/2) * (ops[f'sigma_{level_i}{level_j}'] + ops[f'sigma_{level_j}{level_i}'])
+
+        # 添加失谐项
+        H_detuning = -detuning * ops[f'P_{level_j}']
+
+        return H_coupling + H_detuning
+
+    ops['drive'] = drive
+
+    # 自发辐射Lindblad算符构建函数
+    def spontaneous_emission(gamma: float, level_g: int, level_e: int) -> qt.Qobj:
         """
-        为给定的量子系统构建噪声模型。
-        
-        被调用者: 外部调用, TimeEvolution.evolve_with_system_hamiltonian,
-                TimeEvolution.evolve_multiple_steps_with_hamiltonian,
-                build_multi_system_noise
-        调用: NoiseModelBuilder.__init__, NoiseModelBuilder.build_collapse_operators
-        
+        构建描述原子自发辐射的Lindblad算符。
+
         参数:
-            quantum_state: 量子系统
-            noise_types: 要包含的噪声类型列表，如为None则包含所有类型
-            
+        -------
+        gamma : float
+            自发辐射速率（单位：rad/s）
+        level_g : int
+            基态索引
+        level_e : int
+            激发态索引
+
         返回:
-            List[qt.Qobj]: 崩塌算符列表
+        -------
+        qt.Qobj: 自发辐射算符，形式为 √γ|g⟩⟨e|
         """
-        # 使用构建器创建基本噪声列表
-        builder = NoiseModelBuilder(quantum_state)
-        all_cops = builder.build_collapse_operators()
-        
-        # 如果未指定噪声类型或要求包含所有类型，直接返回完整列表
-        if noise_types is None:
-            return all_cops
-            
-        # 否则，只保留特定类型的噪声
-        filtered_cops = []
-        
-        # 根据系统中的子系统和指定的噪声类型进行过滤
-        have_atoms = any(t == 'atom' for t in quantum_state.subsystem_types)
-        have_cavities = any(t == 'cavity' for t in quantum_state.subsystem_types)
-        
-        # 对每个崩塌算符应用过滤器
-        for cop in all_cops:
-            if ('spontaneous_emission' in noise_types and have_atoms) or \
-               ('dephasing' in noise_types and have_atoms) or \
-               ('cavity_loss' in noise_types and have_cavities) or \
-               ('depolarizing' in noise_types):
-                filtered_cops.append(cop)
-        
-        # 如果过滤后为空，但应该有噪声，返回原始列表
-        if not filtered_cops and all_cops:
-            logger.warning(f"噪声类型过滤后为空，返回所有噪声: {noise_types}")
-            return all_cops
-            
-        return filtered_cops
-    
-    @staticmethod
-    def build_multi_system_noise(systems: Dict[str, QuantumState], 
-                                noise_types: Optional[List[str]] = None) -> Dict[str, List[qt.Qobj]]:
+        return np.sqrt(gamma) * ops[f'sigma_{level_g}{level_e}']
+
+    ops['spontaneous_emission'] = spontaneous_emission
+
+    # 退相位Lindblad算符构建函数
+    def dephasing(gamma_phi: float, level: int) -> qt.Qobj:
         """
-        为多个量子系统构建噪声模型。
-        
-        被调用者: 外部调用, TimeEvolution.evolve_all_systems_with_hamiltonian
-        调用: build_for_system
-        
+        构建描述纯退相位的Lindblad算符。
+
         参数:
-            systems: 量子系统字典 {系统名称: 量子系统}
-            noise_types: 要包含的噪声类型列表，如果为None则包含所有类型
-            
+        -------
+        gamma_phi : float
+            退相位速率（单位：rad/s）
+        level : int
+            受影响能级的索引
+
         返回:
-            Dict[str, List[qt.Qobj]]: 噪声算符字典 {系统名称: 崩塌算符列表}
+        -------
+        qt.Qobj: 退相位算符，形式为 √γ_φ|level⟩⟨level|
         """
-        noise_dict = {}
-        for name, system in systems.items():
-            noise_dict[name] = NoiseModelBuilder.build_for_system(system, noise_types)
-        return noise_dict 
+        return np.sqrt(gamma_phi) * ops[f'P_{level}']
+
+    ops['dephasing'] = dephasing
+
+    # Rydberg相互作用哈密顿量构建函数
+    def rydberg_interaction(V_rr: float, r_level: int, dims: List[int]) -> qt.Qobj:
+        """
+        构建描述两个原子之间Rydberg相互作用的哈密顿量。
+
+        参数:
+        -------
+        V_rr : float
+            Rydberg相互作用强度（单位：rad/s）
+        r_level : int
+            Rydberg态的索引
+        dims : List[int]
+            系统的维度列表，如 [dim, dim] 表示两个相同的原子
+
+        返回:
+        -------
+        qt.Qobj: Rydberg相互作用哈密顿量，形式为 V_rr|r⟩₁⟨r|⊗|r⟩₂⟨r|
+        """
+        # 使用interaction_term函数构建相互作用项
+        return interaction_term(ops[f'P_{r_level}'], 0, ops[f'P_{r_level}'], 1, V_rr, dims)
+
+    ops['rydberg_interaction'] = rydberg_interaction
+
+    return ops
+
+
+def create_cavity_operators(dim: int, cavity_freq: Optional[float] = None) -> Dict[str, Any]:
+    """
+    创建腔场系统的常用算符，包括基本算符、哈密顿量和Lindblad项。
+
+    被调用者: 外部调用
+    调用: 无其他函数
+
+    参数:
+    -------
+    dim : int
+        腔场的截断维度（最大光子数+1）
+    cavity_freq : Optional[float]
+        腔场频率（单位：rad/s），若为None则设为0
+
+    返回:
+    -------
+    Dict[str, Any]: 常用算符的字典，包括：
+        - 基本算符:
+          - 'a': 湮灭算符
+          - 'a_dag': 创生算符
+          - 'n': 数算符
+          - 'P_i': 光子数态投影算符 |i⟩⟨i|
+        - 哈密顿量:
+          - 'H_0': 腔场能量哈密顿量 ħω_c a†a
+        - 构建函数:
+          - 'decay': 函数，用于构建腔场衰减Lindblad算符
+          - 'displacement': 函数，用于构建相干驱动哈密顿量
+    """
+    ops = {}
+
+    # 基本算符
+    ops['a'] = qt.destroy(dim)
+    ops['a_dag'] = qt.create(dim)
+    ops['n'] = ops['a_dag'] * ops['a']
+
+    # 光子数态投影
+    for i in range(dim):
+        ops[f'P_{i}'] = qt.basis(dim, i) * qt.basis(dim, i).dag()
+
+    # 腔场能量哈密顿量
+    if cavity_freq is None:
+        cavity_freq = 0.0
+
+    ops['H_0'] = cavity_freq * ops['n']
+
+    # 腔场衰减Lindblad算符构建函数
+    def decay(kappa: float) -> qt.Qobj:
+        """
+        构建描述腔场衰减的Lindblad算符。
+
+        参数:
+        -------
+        kappa : float
+            腔场衰减速率（单位：rad/s）
+
+        返回:
+        -------
+        qt.Qobj: 腔场衰减算符，形式为 √κ·a
+        """
+        return np.sqrt(kappa) * ops['a']
+
+    ops['decay'] = decay
+
+    # 腔场相干驱动哈密顿量构建函数
+    def displacement(epsilon: float, phase: float = 0.0) -> qt.Qobj:
+        """
+        构建描述腔场相干驱动的哈密顿量。
+
+        参数:
+        -------
+        epsilon : float
+            驱动强度（单位：rad/s）
+        phase : float
+            驱动相位（单位：rad）
+
+        返回:
+        -------
+        qt.Qobj: 驱动哈密顿量，形式为 ε(e^{iφ}a† + e^{-iφ}a)
+        """
+        return epsilon * (np.exp(1j*phase) * ops['a_dag'] + np.exp(-1j*phase) * ops['a'])
+
+    ops['displacement'] = displacement
+
+    return ops
+
+
+def create_interaction_operators(atom_ops: Dict[str, Any], cavity_ops: Dict[str, Any],
+                               cavity_dim: int) -> Dict[str, Any]:
+    """
+    创建描述原子-腔相互作用的算符。
+
+    被调用者: 外部调用
+    调用: 无其他函数
+
+    参数:
+    -------
+    atom_ops : Dict[str, Any]
+        原子系统算符字典，由create_atomic_operators生成
+    cavity_ops : Dict[str, Any]
+        腔场系统算符字典，由create_cavity_operators生成
+    cavity_dim : int
+        腔场的截断维度
+
+    返回:
+    -------
+    Dict[str, Any]: 相互作用算符的字典，包括：
+        - 构建函数:
+          - 'jaynes_cummings': 函数，用于构建Jaynes-Cummings哈密顿量
+          - 'beam_splitter': 函数，用于构建分束器哈密顿量
+    """
+    ops = {}
+
+    # Jaynes-Cummings哈密顿量构建函数
+    def jaynes_cummings(g_coupling: float, level_g: int, level_e: int) -> qt.Qobj:
+        """
+        构建Jaynes-Cummings哈密顿量，描述原子-腔耦合。
+
+        参数:
+        -------
+        g_coupling : float
+            原子-腔耦合强度（单位：rad/s）
+        level_g : int
+            基态索引
+        level_e : int
+            激发态索引
+
+        返回:
+        -------
+        qt.Qobj: Jaynes-Cummings哈密顿量，形式为 g(σ⁺a + σ⁻a†)
+        """
+        # 获取原子跃迁算符
+        sigma_plus = atom_ops[f'sigma_{level_e}{level_g}']
+        sigma_minus = atom_ops[f'sigma_{level_g}{level_e}']
+
+        # 构建相互作用项
+        H_int = g_coupling * (qt.tensor(sigma_plus, cavity_ops['a']) +
+                             qt.tensor(sigma_minus, cavity_ops['a_dag']))
+
+        return H_int
+
+    ops['jaynes_cummings'] = jaynes_cummings
+
+    # 分束器哈密顿量构建函数
+    def beam_splitter(kappa: float) -> qt.Qobj:
+        """
+        构建描述两个腔模式之间分束器耦合的哈密顿量。
+
+        参数:
+        -------
+        kappa : float
+            分束器耦合强度（单位：rad/s）
+
+        返回:
+        -------
+        qt.Qobj: 分束器哈密顿量，形式为 κ(a₁†a₂ + a₂†a₁)
+        """
+        # 创建两个腔场的算符
+        a1 = qt.tensor(cavity_ops['a'], qt.qeye(cavity_dim))
+        a2 = qt.tensor(qt.qeye(cavity_dim), cavity_ops['a'])
+
+        # 构建分束器哈密顿量
+        H_BS = kappa * (a1.dag() * a2 + a2.dag() * a1)
+
+        return H_BS
+
+    ops['beam_splitter'] = beam_splitter
+
+    return ops
+
+
+# ================ 辅助函数 ================
+
+def build_total_hamiltonian(h_terms: List[qt.Qobj]) -> qt.Qobj:
+    """
+    将多个哈密顿量项组合成总哈密顿量。
+
+    被调用者: 外部调用
+    调用: 无其他函数
+
+    参数:
+    -------
+    h_terms : List[qt.Qobj]
+        哈密顿量项列表
+
+    返回:
+    -------
+    qt.Qobj: 总哈密顿量
+    """
+    if not h_terms:
+        raise ValueError("哈密顿量项列表不能为空")
+
+    # 检查所有项的维度是否一致
+    dims = h_terms[0].dims
+    for i, h in enumerate(h_terms):
+        if h.dims != dims:
+            raise ValueError(f"哈密顿量项 {i} 的维度 {h.dims} 与第一项的维度 {dims} 不匹配")
+
+    # 相加所有项
+    h_total = sum(h_terms)
+    return h_total
+
+
+def build_time_dependent_hamiltonian(h_list: List[qt.Qobj],
+                                    coeffs: List[Callable[[float], float]]) -> List:
+    """
+    构建时间依赖哈密顿量，适用于QuTiP的求解器。
+
+    被调用者: 外部调用
+    调用: 无其他函数
+
+    参数:
+    -------
+    h_list : List[qt.Qobj]
+        哈密顿量项列表
+    coeffs : List[Callable[[float], float]]
+        时间依赖系数函数列表，与h_list一一对应
+
+    返回:
+    -------
+    List: QuTiP格式的时间依赖哈密顿量 [h_list, coeffs]
+    """
+    if len(h_list) != len(coeffs):
+        raise ValueError(f"哈密顿量项数量 {len(h_list)} 与系数函数数量 {len(coeffs)} 不匹配")
+
+    return [h_list, coeffs]
+
+
+def apply_rotating_frame(hamiltonian: qt.Qobj,
+                         frame_operator: qt.Qobj,
+                         omega: float) -> qt.Qobj:
+    """
+    将哈密顿量变换到旋转坐标系。
+
+    被调用者: 外部调用
+    调用: 无其他函数
+
+    参数:
+    -------
+    hamiltonian : qt.Qobj
+        原始哈密顿量
+    frame_operator : qt.Qobj
+        定义旋转坐标系的算符，如 σz/2 或 a†a
+    omega : float
+        旋转频率（单位：rad/s）
+
+    返回:
+    -------
+    qt.Qobj: 旋转坐标系下的哈密顿量 H_rot = H - ω·A
+    """
+    return hamiltonian - omega * frame_operator
+
+
+def check_hermitian(operator: qt.Qobj, tol: float = 1e-10) -> bool:
+    """
+    检查算符是否是厄米的（自伴的）。
+
+    被调用者: 外部调用
+    调用: 无其他函数
+
+    参数:
+    -------
+    operator : qt.Qobj
+        要检查的算符
+    tol : float
+        容差
+
+    返回:
+    -------
+    bool: 如果算符是厄米的，则为True
+    """
+    diff = operator - operator.dag()
+    return diff.norm() < tol
+
+
+# ================ 测试代码 ================
+
+def main():
+    """
+    测试量子算符构建函数的主函数。
+
+    分三步测试：
+    1. 构建5能级原子的哈密顿量和Lindblad项
+    2. 构建3能级光学腔的哈密顿量
+    3. 将原子和腔系统组合成15×15的哈密顿量并添加耦合项
+    """
+    print("=" * 80)
+    print("测试量子算符构建函数")
+    print("=" * 80)
+
+    # 步骤1：构建5能级原子的哈密顿量和Lindblad项
+    print("\n步骤1：构建5能级原子的哈密顿量和Lindblad项")
+    print("-" * 60)
+
+    # 创建5能级原子系统
+    atom_dim = 5
+    level_labels = ['g', 's', 'e0', 'e1', 'r']
+    # 能级能量（单位：GHz，相对于基态）
+    energies = [0.0, 1.0, 2.0, 2.1, 10.0]
+
+    print(f"创建{atom_dim}能级原子系统，能级标签：{level_labels}")
+    print(f"能级能量（GHz）：{energies}")
+
+    # 创建原子算符
+    atom_ops = create_atomic_operators(atom_dim, level_labels, energies)
+
+    # 构建原子哈密顿量
+    H_atom = atom_ops['H_0']
+    print("\n原子本征能量哈密顿量：")
+    print(H_atom)
+
+    # 添加驱动项（|g⟩ ↔ |e0⟩）
+    rabi_freq = 0.1  # Rabi频率（GHz）
+    detuning = 0.05  # 失谐（GHz）
+    H_drive = atom_ops['drive'](rabi_freq, detuning, 0, 2)  # |g⟩(0) ↔ |e0⟩(2)
+    print(f"\n添加驱动项 |g⟩ ↔ |e0⟩，Rabi频率：{rabi_freq} GHz，失谐：{detuning} GHz")
+    print(H_drive)
+
+    # 构建总原子哈密顿量
+    H_atom_total = H_atom + H_drive
+    print("\n总原子哈密顿量：")
+    print(H_atom_total)
+
+    # 构建Lindblad项
+    gamma = 0.01  # 自发辐射速率（GHz）
+    L_spontaneous = atom_ops['spontaneous_emission'](gamma, 0, 2)  # |e0⟩(2) → |g⟩(0)
+    print(f"\n自发辐射Lindblad项 |e0⟩ → |g⟩，速率：{gamma} GHz")
+    print(L_spontaneous)
+
+    # 添加退相位
+    gamma_phi = 0.005  # 退相位速率（GHz）
+    L_dephasing = atom_ops['dephasing'](gamma_phi, 4)  # Rydberg态退相位
+    print(f"\nRydberg态退相位Lindblad项，速率：{gamma_phi} GHz")
+    print(L_dephasing)
+
+    # 验证哈密顿量是否是厄米的
+    is_hermitian = check_hermitian(H_atom_total)
+    print(f"\n总原子哈密顿量是否厄米：{is_hermitian}")
+
+    # 步骤2：构建3能级光学腔的哈密顿量
+    print("\n\n步骤2：构建3能级光学腔的哈密顿量")
+    print("-" * 60)
+
+    # 创建3能级光学腔系统（0, 1, 2光子态）
+    cavity_dim = 3
+    cavity_freq = 2.0  # 腔频率（GHz）
+
+    print(f"创建{cavity_dim}能级光学腔系统（0, 1, 2光子态）")
+    print(f"腔频率：{cavity_freq} GHz")
+
+    # 创建腔场算符
+    cavity_ops = create_cavity_operators(cavity_dim, cavity_freq)
+
+    # 构建腔场哈密顿量
+    H_cavity = cavity_ops['H_0']
+    print("\n腔场能量哈密顿量：")
+    print(H_cavity)
+
+    # 添加相干驱动
+    epsilon = 0.05  # 驱动强度（GHz）
+    H_displacement = cavity_ops['displacement'](epsilon)
+    print(f"\n添加相干驱动，强度：{epsilon} GHz")
+    print(H_displacement)
+
+    # 构建总腔场哈密顿量
+    H_cavity_total = H_cavity + H_displacement
+    print("\n总腔场哈密顿量：")
+    print(H_cavity_total)
+
+    # 构建腔场衰减Lindblad项
+    kappa = 0.02  # 腔衰减速率（GHz）
+    L_cavity = cavity_ops['decay'](kappa)
+    print(f"\n腔场衰减Lindblad项，速率：{kappa} GHz")
+    print(L_cavity)
+
+    # 验证哈密顿量是否是厄米的
+    is_hermitian = check_hermitian(H_cavity_total)
+    print(f"\n总腔场哈密顿量是否厄米：{is_hermitian}")
+
+    # 步骤3：将原子和腔系统组合成15×15的哈密顿量并添加耦合项
+    print("\n\n步骤3：将原子和腔系统组合成15×15的哈密顿量并添加耦合项")
+    print("-" * 60)
+
+    print(f"组合{atom_dim}能级原子和{cavity_dim}能级腔场系统")
+    print(f"总维度：{atom_dim} × {cavity_dim} = {atom_dim * cavity_dim}")
+
+    # 创建相互作用算符
+    interaction_ops = create_interaction_operators(atom_ops, cavity_ops, cavity_dim)
+
+    # 构建复合系统哈密顿量
+    # 1. 原子部分
+    H_atom_in_composite = qt.tensor(H_atom_total, qt.qeye(cavity_dim))
+    print("\n复合系统中的原子哈密顿量：")
+    print(f"维度：{H_atom_in_composite.shape}")
+
+    # 2. 腔场部分
+    H_cavity_in_composite = qt.tensor(qt.qeye(atom_dim), H_cavity_total)
+    print("\n复合系统中的腔场哈密顿量：")
+    print(f"维度：{H_cavity_in_composite.shape}")
+
+    # 3. Jaynes-Cummings相互作用
+    g_coupling = 0.1  # 原子-腔耦合强度（GHz）
+    H_JC = interaction_ops['jaynes_cummings'](g_coupling, 0, 2)  # |g⟩(0) ↔ |e0⟩(2)
+    print(f"\nJaynes-Cummings相互作用，耦合强度：{g_coupling} GHz")
+    print(f"维度：{H_JC.shape}")
+
+    # 构建总哈密顿量
+    H_total = H_atom_in_composite + H_cavity_in_composite + H_JC
+    print("\n总系统哈密顿量：")
+    print(f"维度：{H_total.shape}")
+
+    # 构建复合系统的Lindblad项
+    # 1. 原子自发辐射
+    L_spontaneous_in_composite = qt.tensor(L_spontaneous, qt.qeye(cavity_dim))
+    print("\n复合系统中的原子自发辐射Lindblad项：")
+    print(f"维度：{L_spontaneous_in_composite.shape}")
+
+    # 2. 腔场衰减
+    L_cavity_in_composite = qt.tensor(qt.qeye(atom_dim), L_cavity)
+    print("\n复合系统中的腔场衰减Lindblad项：")
+    print(f"维度：{L_cavity_in_composite.shape}")
+
+    # 验证总哈密顿量是否是厄米的
+    is_hermitian = check_hermitian(H_total)
+    print(f"\n总系统哈密顿量是否厄米：{is_hermitian}")
+
+    print("\n测试完成！")
+
+
+if __name__ == "__main__":
+    main()
