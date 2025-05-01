@@ -771,6 +771,8 @@ def main():
     H_total = H_atom_in_composite + H_cavity_in_composite + H_JC
     print("\n总系统哈密顿量：")
     print(f"维度：{H_total.shape}")
+    print("哈密顿量内容：")
+    print(H_total)
 
     # 构建复合系统的Lindblad项
     # 1. 原子自发辐射
