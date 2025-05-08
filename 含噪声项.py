@@ -44,6 +44,13 @@ class TwoCavityThreeLevelAtom:
         self.gamma_phi_10 = 1.0
         self.gamma_phi_21 = 1.0
 
+        # 模式维度与算符
+        self.d_cav = 2
+        self.d_atom = 3
+        self.a = qt.destroy(self.d_cav)
+        self.I_cav = qt.qeye(self.d_cav)
+        self.I_atom = qt.qeye(self.d_atom)
+
         # 原子投影与跃迁算符
         self.proj = [qt.basis(self.d_atom, i) * qt.basis(self.d_atom, i).dag()
                      for i in range(self.d_atom)]
@@ -89,6 +96,7 @@ class TwoCavityThreeLevelAtom:
         self.noise_dt = noise_params.get('noise_dt', 1e-9)
         self.ou_x1 = 0.0
         self.ou_x2 = 0.0
+        self.coupling_err = 1.0
         
         # Telegraph 噪声参数
         self.telegraph_rate = noise_params.get('telegraph_rate', 1e3)
